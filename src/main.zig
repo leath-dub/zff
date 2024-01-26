@@ -16,6 +16,38 @@ pub inline fn castIntNormal(comptime From: type, comptime To: type, value: From)
     return @intFromFloat(@round((@as(f64, @floatFromInt(value)) / maxf_src) * maxf_dst));
 }
 
+pub fn Chunks(comptime T: type) type {
+    return struct {
+        index: ?usize,
+        buffer: []const T,
+        size: usize,
+
+        pub inline fn first(self: *const @This()) []const T {
+            std.debug.assert(self.index.? == 0);
+            return self.next().?;
+        }
+
+        pub inline fn next(self: *@This()) ?[]const T {
+            if (self.buffer[self.index.? * self.size ..].len == 0) return null;
+            defer self.index.? += 1;
+            return self.buffer[self.index.? * self.size .. (self.index.? + 1) * self.size];
+        }
+
+        pub inline fn reset(self: *@This()) void {
+            self.index = 0;
+        }
+    };
+}
+
+pub fn chunks(comptime T: type, buffer: []const T, size: usize) Chunks(T) {
+    std.debug.assert(size != 0);
+    return .{
+        .index = 0,
+        .buffer = buffer,
+        .size = size,
+    };
+}
+
 pub fn Farbfeld(comptime Int: type) type {
     if (@typeInfo(Int).Int.bits >= 64) {
         @compileError("This image encoder and decoder only supports images with pixel data values of integer type with bits < 64");
@@ -41,26 +73,14 @@ pub fn Farbfeld(comptime Int: type) type {
             const rest = data[16..];
 
             var pixels = ArrayList(Pixel).init(allocator);
-            var window = mem.window(u8, rest, @sizeOf(@Vector(4, u16)), 1);
+            var chunksi = chunks(u8, rest, @sizeOf(@Vector(4, u16)));
 
-            var x = false;
-
-            while (window.next()) |raw_pix| {
+            while (chunksi.next()) |raw_pix| {
                 var pix: Pixel = .{ 0, 0, 0, 0 };
+                var sub_chunksi = chunks(u8, raw_pix, 2);
 
-                if (Int == u16) { // What farbfeld natively uses, no need for casting
-                    inline for (0..4) |i| {
-                        pix[i] = mem.readIntSliceBig(u16, raw_pix[i .. i + 2]);
-                    }
-                } else {
-                    inline for (0..4) |i| {
-                        pix[i] = castIntNormal(u16, Int, mem.readIntSliceBig(u16, raw_pix[i .. i + 2]));
-                    }
-                }
-
-                if (x) {
-                    std.debug.print("{} {} {} {}\n", .{ pix[0], pix[1], pix[2], pix[3] });
-                    x = true;
+                while (sub_chunksi.next()) |raw_pix_comp| {
+                    pix[sub_chunksi.index.? - 1] = if (Int == u16) mem.readIntSliceBig(u16, raw_pix_comp) else castIntNormal(u16, Int, mem.readIntSliceBig(u16, raw_pix_comp));
                 }
 
                 try pixels.append(pix);
@@ -74,7 +94,7 @@ pub fn Farbfeld(comptime Int: type) type {
             };
         }
 
-        pub fn ByteInt(comptime T: type) type {
+        pub fn ByteInt(comptime T: type) @TypeOf([@divExact(@typeInfo(T).Int.bits, 8)]u8) {
             return [@divExact(@typeInfo(T).Int.bits, 8)]u8;
         }
 
@@ -95,13 +115,13 @@ pub fn Farbfeld(comptime Int: type) type {
                 if (Int == u16) { // What farbfeld natively uses, no need for casting
                     inline for (@as([4]u16, pix)) |n| {
                         var pix_comp: ByteInt(u16) = undefined;
-                        mem.writeIntSliceBig(u16, &pix_comp, n);
+                        mem.writeIntBig(u16, &pix_comp, n);
                         try result.appendSlice(&pix_comp);
                     }
                 } else {
                     inline for (@as([4]Int, pix)) |n| {
                         var pix_comp: ByteInt(u16) = undefined;
-                        mem.writeIntSliceBig(u16, &pix_comp, castIntNormal(Int, u16, n));
+                        mem.writeIntBig(u16, &pix_comp, castIntNormal(Int, u16, n));
                         try result.appendSlice(&pix_comp);
                     }
                 }
@@ -162,4 +182,15 @@ test "Test encode u8 pixel values" {
 
     var encoded_bytes = try image.encode(testing.allocator);
     defer testing.allocator.free(encoded_bytes);
+}
+
+test "Test that decode and re-encode produces the same result" {
+    const start_bytes = @embedFile("cat");
+    const image = try Farbfeld(u16).decode(testing.allocator, start_bytes);
+    defer image.deinit();
+
+    const encoded_bytes = try image.encode(testing.allocator);
+    defer testing.allocator.free(encoded_bytes);
+
+    try testing.expect(mem.eql(u8, start_bytes, encoded_bytes));
 }
